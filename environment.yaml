@@ -1,18 +1,21 @@
-name: tdmpc
+name: tdmpc-m2
 channels:
-  - defaults
+  - conda-forge   # Indispensable pour les paquets Mac ARM64 récents
+  - pytorch
 dependencies:
-  - python=3.8
-  - pytorch=1.9
+  - python=3.10   
+  - pytorch       
   - torchvision
-  - cudatoolkit=11.1
   - pip
   - pip:
     - termcolor
     - omegaconf
-    - gym==0.21.0
-    - dm-control==0.0.403778684
     - pandas
     - wandb
     - moviepy
     - imageio
+    # Gym est un cas particulier (voir explication plus bas)
+    - gym==0.21.0 
+    # Correction pour installer gym 0.21 sur des python récents
+    - setuptools==65.5.0 
+    - wheel

@@ -1,232 +1,340 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from copy import deepcopy
 import algorithm.helper as h
 
-
 class TOLD(nn.Module):
-	"""Task-Oriented Latent Dynamics (TOLD) model used in TD-MPC."""
-	def __init__(self, cfg):
-		super().__init__()
-		self.cfg = cfg
-		self._encoder = h.enc(cfg)
-		self._dynamics = h.mlp(cfg.latent_dim+cfg.action_dim, cfg.mlp_dim, cfg.latent_dim)
-		self._reward = h.mlp(cfg.latent_dim+cfg.action_dim, cfg.mlp_dim, 1)
-		self._pi = h.mlp(cfg.latent_dim, cfg.mlp_dim, cfg.action_dim)
-		self._Q1, self._Q2 = h.q(cfg), h.q(cfg)
-		self.apply(h.orthogonal_init)
-		for m in [self._reward, self._Q1, self._Q2]:
-			m[-1].weight.data.fill_(0)
-			m[-1].bias.data.fill_(0)
+    """
+    Modèle TOLD mis à jour avec l'architecture TD-MPC2 :
+    - LayerNorm + Mish (via h.mlp / h.q)
+    - SimNorm sur l'état latent
+    - Ensemble de 5 Q-functions
+    - Politique stochastique (MaxEnt RL)
+    """
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self._encoder = h.enc(cfg) # Inclut déjà SimNorm dans le nouveau helper
+        
+        # Dynamique avec SimNorm en sortie
+        self._dynamics = h.mlp(cfg.latent_dim+cfg.action_dim, cfg.mlp_dim, cfg.latent_dim, last_act=h.SimNorm(cfg))
+        self._reward = h.mlp(cfg.latent_dim+cfg.action_dim, cfg.mlp_dim, 1)
+        
+        # Politique stochastique : sort Moyenne + LogStd (2 * action_dim)
+        self._pi = h.mlp(cfg.latent_dim, cfg.mlp_dim, 2*cfg.action_dim)
+        
+        # Ensemble de 5 Q-functions avec Dropout (défini dans h.q)
+        self._Qs = nn.ModuleList([h.q(cfg) for _ in range(5)])
+        
+        self.apply(h.orthogonal_init)
+        # Initialisation à zéro de la dernière couche pour stabiliser le début
+        for m in [self._reward]:
+            m[-1].weight.data.fill_(0)
+            m[-1].bias.data.fill_(0)
 
-	def track_q_grad(self, enable=True):
-		"""Utility function. Enables/disables gradient tracking of Q-networks."""
-		for m in [self._Q1, self._Q2]:
-			h.set_requires_grad(m, enable)
+    def track_q_grad(self, enable=True):
+        for m in self._Qs:
+            h.set_requires_grad(m, enable)
 
-	def h(self, obs):
-		"""Encodes an observation into its latent representation (h)."""
-		return self._encoder(obs)
+    def h(self, obs):
+        return self._encoder(obs)
 
-	def next(self, z, a):
-		"""Predicts next latent state (d) and single-step reward (R)."""
-		x = torch.cat([z, a], dim=-1)
-		return self._dynamics(x), self._reward(x)
+    def next(self, z, a):
+        x = torch.cat([z, a], dim=-1)
+        return self._dynamics(x), self._reward(x)
 
-	def pi(self, z, std=0):
-		"""Samples an action from the learned policy (pi)."""
-		mu = torch.tanh(self._pi(z))
-		if std > 0:
-			std = torch.ones_like(mu) * std
-			return h.TruncatedNormal(mu, std).sample(clip=0.3)
-		return mu
+    def pi(self, z, eval_mode=False):
+        """Politique Gaussienne avec reparamétrisation (MaxEnt RL)"""
+        mu, log_std = self._pi(z).chunk(2, dim=-1)
+        log_std = torch.clamp(log_std, -10, 2) # Bornes de stabilité
+        std = log_std.exp()
+        
+        if eval_mode:
+            return torch.tanh(mu)
+        
+        eps = torch.randn_like(mu)
+        action = torch.tanh(mu + eps * std)
+        
+        # Calcul de l'entropie (approximée pour le squashing tanh)
+        log_prob = h.gaussian_logprob(eps, log_std) - torch.log(1 - action.pow(2) + 1e-6).sum(-1, keepdim=True)
+        return action, log_prob
 
-	def Q(self, z, a):
-		"""Predict state-action value (Q)."""
-		x = torch.cat([z, a], dim=-1)
-		return self._Q1(x), self._Q2(x)
+    def Q(self, z, a):
+        """Retourne les 5 prédictions de l'ensemble"""
+        x = torch.cat([z, a], dim=-1)
+        return torch.stack([m(x) for m in self._Qs])
+    
+    
+    def compute_zgr_from_z(self, z: torch.Tensor, eps: float = 1e-6) -> float:
 
+        if z.grad is None:
+            raise RuntimeError("z.grad is None. Did you forget retain_grad() or backward()?")
+
+        with torch.no_grad():
+            zero_grad_mask = (z.grad.abs() < eps)
+            return zero_grad_mask.float().mean().item()
+
+    def compute_fzar_from_obs(self, obs: torch.Tensor, eps: float = 1e-3) -> float:
+        """
+        Compute Feature Zero Activation Ratio from backbone output.
+        
+        obs: batch of real observations
+        eps: threshold for considering a feature "effectively zero"
+        """
+        self._encoder.eval()  # stable evaluation mode
+        with torch.no_grad():
+            z = self.h(obs)
+            zero_mask = (z.abs() < eps)
+            return zero_mask.float().mean().item()
+
+    def compute_srank(self, obs: torch.Tensor, delta: float = 0.01) -> int:
+        """
+        Compute the effective feature rank (srank) of the backbone output.
+        obs: batch of observations
+        delta: threshold for cumulative singular values (default 0.01)
+        """
+        self._encoder.eval()
+        with torch.no_grad():
+            z = self.h(obs)              # (batch_size, latent_dim)
+            z_cpu = z.detach().cpu()
+            z_centered = z_cpu - z_cpu.mean(dim=0, keepdim=True)
+
+            sigma = torch.linalg.svdvals(z_centered)
+            cum_sum = torch.cumsum(sigma, dim=0)
+            total_sum = sigma.sum()
+            k = torch.searchsorted(cum_sum / total_sum, 1 - delta)
+            return int(k.item() + 1)
 
 class TDMPC():
-	"""Implementation of TD-MPC learning + inference."""
-	def __init__(self, cfg):
-		self.cfg = cfg
-		self.device = torch.device('cuda')
-		self.std = h.linear_schedule(cfg.std_schedule, 0)
-		self.model = TOLD(cfg).cuda()
-		self.model_target = deepcopy(self.model)
-		self.optim = torch.optim.Adam(self.model.parameters(), lr=self.cfg.lr)
-		self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=self.cfg.lr)
-		self.aug = h.RandomShiftsAug(cfg)
-		self.model.eval()
-		self.model_target.eval()
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+        
+        self.std = h.linear_schedule(cfg.std_schedule, 0)
+        self.model = TOLD(cfg).to(self.device)
+        self.model_target = deepcopy(self.model)
+        self.optim = torch.optim.Adam(self.model.parameters(), lr=self.cfg.lr)
+        self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=self.cfg.lr)
+        self.aug = h.RandomShiftsAug(cfg)
+        
+        # Coefficient d'entropie (Alpha) pour MaxEnt RL
+        self.alpha = cfg.entropy_coef if hasattr(cfg, 'entropy_coef') else 0.05
+        
+        self.model.eval()
+        self.model_target.eval()
+        self.initial_model = deepcopy(self.model)
+        self.initial_model.eval()
+        h.set_requires_grad(self.initial_model, False)
 
-	def state_dict(self):
-		"""Retrieve state dict of TOLD model, including slow-moving target network."""
-		return {'model': self.model.state_dict(),
-				'model_target': self.model_target.state_dict()}
+    @torch.no_grad()
+    def estimate_value(self, z, actions, horizon):
+        G, discount = 0, 1
+        for t in range(horizon):
+            z, reward = self.model.next(z, actions[t])
+            G += discount * reward
+            discount *= self.cfg.discount
+        
+        # TD-MPC2 : Min de 2 Q-functions tirées aléatoirement
+        qs = self.model.Q(z, self.model.pi(z, eval_mode=True))
+        q_min = torch.min(qs[torch.randperm(5)[:2]], dim=0).values
+        G += discount * q_min
+        return G
 
-	def save(self, fp):
-		"""Save state dict of TOLD model to filepath."""
-		torch.save(self.state_dict(), fp)
-	
-	def load(self, fp):
-		"""Load a saved state dict from filepath into current agent."""
-		d = torch.load(fp)
-		self.model.load_state_dict(d['model'])
-		self.model_target.load_state_dict(d['model_target'])
+    @torch.no_grad()
+    def plan(self, obs, eval_mode=False, step=None, t0=True):
+        if step < self.cfg.seed_steps and not eval_mode:
+            return torch.empty(self.cfg.action_dim, device=self.device).uniform_(-1, 1)
 
-	@torch.no_grad()
-	def estimate_value(self, z, actions, horizon):
-		"""Estimate value of a trajectory starting at latent state z and executing given actions."""
-		G, discount = 0, 1
-		for t in range(horizon):
-			z, reward = self.model.next(z, actions[t])
-			G += discount * reward
-			discount *= self.cfg.discount
-		G += discount * torch.min(*self.model.Q(z, self.model.pi(z, self.cfg.min_std)))
-		return G
+        obs = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        horizon = int(min(self.cfg.horizon, h.linear_schedule(self.cfg.horizon_schedule, step)))
+        
+        # Initialisation CEM (sans momentum entre itérations comme TD-MPC2)
+        z = self.model.h(obs).repeat(self.cfg.num_samples, 1)
+        mean = torch.zeros(horizon, self.cfg.action_dim, device=self.device)
+        std = 2*torch.ones(horizon, self.cfg.action_dim, device=self.device)
+        
+        if not t0 and hasattr(self, '_prev_mean'):
+            mean[:-1] = self._prev_mean[1:]
 
-	@torch.no_grad()
-	def plan(self, obs, eval_mode=False, step=None, t0=True):
-		"""
-		Plan next action using TD-MPC inference.
-		obs: raw input observation.
-		eval_mode: uniform sampling and action noise is disabled during evaluation.
-		step: current time step. determines e.g. planning horizon.
-		t0: whether current step is the first step of an episode.
-		"""
-		# Seed steps
-		if step < self.cfg.seed_steps and not eval_mode:
-			return torch.empty(self.cfg.action_dim, dtype=torch.float32, device=self.device).uniform_(-1, 1)
+        for i in range(self.cfg.iterations):
+            actions = torch.clamp(mean.unsqueeze(1) + std.unsqueeze(1) * \
+                torch.randn(horizon, self.cfg.num_samples, self.cfg.action_dim, device=self.device), -1, 1)
 
-		# Sample policy trajectories
-		obs = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-		horizon = int(min(self.cfg.horizon, h.linear_schedule(self.cfg.horizon_schedule, step)))
-		num_pi_trajs = int(self.cfg.mixture_coef * self.cfg.num_samples)
-		if num_pi_trajs > 0:
-			pi_actions = torch.empty(horizon, num_pi_trajs, self.cfg.action_dim, device=self.device)
-			z = self.model.h(obs).repeat(num_pi_trajs, 1)
-			for t in range(horizon):
-				pi_actions[t] = self.model.pi(z, self.cfg.min_std)
-				z, _ = self.model.next(z, pi_actions[t])
+            value = self.estimate_value(z, actions, horizon).nan_to_num_(0)
+            elite_idxs = torch.topk(value.squeeze(1), self.cfg.num_elites, dim=0).indices
+            elite_value, elite_actions = value[elite_idxs], actions[:, elite_idxs]
 
-		# Initialize state and parameters
-		z = self.model.h(obs).repeat(self.cfg.num_samples+num_pi_trajs, 1)
-		mean = torch.zeros(horizon, self.cfg.action_dim, device=self.device)
-		std = 2*torch.ones(horizon, self.cfg.action_dim, device=self.device)
-		if not t0 and hasattr(self, '_prev_mean'):
-			mean[:-1] = self._prev_mean[1:]
+            max_value = elite_value.max(0)[0]
+            score = torch.exp(self.cfg.temperature*(elite_value - max_value))
+            score /= score.sum(0)
+            
+            _mean = torch.sum(score.unsqueeze(0) * elite_actions, dim=1) / (score.sum(0) + 1e-9)
+            _std = torch.sqrt(torch.sum(score.unsqueeze(0) * (elite_actions - _mean.unsqueeze(1)) ** 2, dim=1) / (score.sum(0) + 1e-9))
+            
+            # Mise à jour directe (Suppression du momentum du planificateur)
+            mean, std = _mean, _std.clamp_(self.std, 2)
 
-		# Iterate CEM
-		for i in range(self.cfg.iterations):
-			actions = torch.clamp(mean.unsqueeze(1) + std.unsqueeze(1) * \
-				torch.randn(horizon, self.cfg.num_samples, self.cfg.action_dim, device=std.device), -1, 1)
-			if num_pi_trajs > 0:
-				actions = torch.cat([actions, pi_actions], dim=1)
+        self._prev_mean = mean
+        a = mean[0]
+        if not eval_mode:
+            a += std[0] * torch.randn(self.cfg.action_dim, device=self.device)
+        return a.clamp(-1, 1)
 
-			# Compute elite actions
-			value = self.estimate_value(z, actions, horizon).nan_to_num_(0)
-			elite_idxs = torch.topk(value.squeeze(1), self.cfg.num_elites, dim=0).indices
-			elite_value, elite_actions = value[elite_idxs], actions[:, elite_idxs]
+    def update_pi(self, zs):
+            self.pi_optim.zero_grad(set_to_none=True)
+            self.model.track_q_grad(False) # On ne veut pas entraîner les Q ici
 
-			# Update parameters
-			max_value = elite_value.max(0)[0]
-			score = torch.exp(self.cfg.temperature*(elite_value - max_value))
-			score /= score.sum(0)
-			_mean = torch.sum(score.unsqueeze(0) * elite_actions, dim=1) / (score.sum(0) + 1e-9)
-			_std = torch.sqrt(torch.sum(score.unsqueeze(0) * (elite_actions - _mean.unsqueeze(1)) ** 2, dim=1) / (score.sum(0) + 1e-9))
-			_std = _std.clamp_(self.std, 2)
-			mean, std = self.cfg.momentum * mean + (1 - self.cfg.momentum) * _mean, _std
+            pi_loss = 0
+            for t in range(len(zs) - 1): # On parcourt la séquence
+                z = zs[t]
+                action, log_prob = self.model.pi(z)
+                qs = self.model.Q(z, action)
+                q_avg = qs.mean(dim=0) # TD-MPC2 utilise la moyenne de l'ensemble pour pi
+                
+                rho = (self.cfg.rho ** t)
+                # MaxEnt RL : Maximiser (Valeur + Entropie)
+                pi_loss += (self.alpha * log_prob - q_avg).mean() * rho
 
-		# Outputs
-		score = score.squeeze(1).cpu().numpy()
-		actions = elite_actions[:, np.random.choice(np.arange(score.shape[0]), p=score)]
-		self._prev_mean = mean
-		mean, std = actions[0], _std[0]
-		a = mean
-		if not eval_mode:
-			a += std * torch.randn(self.cfg.action_dim, device=std.device)
-		return a
+            pi_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
+            self.pi_optim.step()
+            self.model.track_q_grad(True)
+            return pi_loss.item()
 
-	def update_pi(self, zs):
-		"""Update policy using a sequence of latent states."""
-		self.pi_optim.zero_grad(set_to_none=True)
-		self.model.track_q_grad(False)
+    @torch.no_grad()
+    def _td_target(self, next_obs, reward):
+        next_z = self.model.h(next_obs)
+        next_action, _ = self.model.pi(next_z)
+        
+        # Cible TD : Min de 2 Q-functions aléatoires du réseau TARGET
+        target_qs = self.model_target.Q(next_z, next_action)
+        target_q_min = torch.min(target_qs[torch.randperm(5)[:2]], dim=0).values
+        return reward + self.cfg.discount * target_q_min
 
-		# Loss is a weighted sum of Q-values
-		pi_loss = 0
-		for t,z in enumerate(zs):
-			a = self.model.pi(z, self.cfg.min_std)
-			Q = torch.min(*self.model.Q(z, a))
-			pi_loss += -Q.mean() * (self.cfg.rho ** t)
+    def update(self, replay_buffer, step):
+            """
+            Version adaptée de TD-MPC2 :
+            1. Rollout latent complet d'abord.
+            2. Calcul des pertes normalisées par l'horizon.
+            3. Échantillonnage uniforme.
+            """
+            # Échantillonnage (Uniforme par défaut dans TD-MPC2)
+            obs, next_obses, action, reward, idxs, weights = replay_buffer.sample()
+            
+            self.optim.zero_grad(set_to_none=True)
+            self.model.train()
 
-		pi_loss.backward()
-		torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm, error_if_nonfinite=False)
-		self.pi_optim.step()
-		self.model.track_q_grad(True)
-		return pi_loss.item()
+            # 1. Préparation des cibles TD (avec le réseau Target)
+            with torch.no_grad():
+                next_z = self.model.h(self.aug(next_obses[0])) # Premier état suivant réel
+                # Note: TD-MPC2 calcule souvent toutes les cibles d'un coup
+                # Ici on garde la logique de boucle pour la compatibilité
+                td_targets = torch.stack([
+                    self._td_target(self.aug(next_obses[t]), reward[t])
+                    for t in range(self.cfg.horizon)
+                ])
 
-	@torch.no_grad()
-	def _td_target(self, next_obs, reward):
-		"""Compute the TD-target from a reward and the observation at the following time step."""
-		next_z = self.model.h(next_obs)
-		td_target = reward + self.cfg.discount * \
-			torch.min(*self.model_target.Q(next_z, self.model.pi(next_z, self.cfg.min_std)))
-		return td_target
+            # 2. Rollout Latent (Imaginer les états futurs)
+            # On stocke tous les états z pour la politique plus tard
+            zs = torch.empty(self.cfg.horizon + 1, self.cfg.batch_size, self.cfg.latent_dim, device=self.device)
+            # Representation
+            z_backbone = self.model.h(self.aug(obs))
+            z_backbone.retain_grad()
 
-	def update(self, replay_buffer, step):
-		"""Main update function. Corresponds to one iteration of the TOLD model learning."""
-		obs, next_obses, action, reward, idxs, weights = replay_buffer.sample()
-		self.optim.zero_grad(set_to_none=True)
-		self.std = h.linear_schedule(self.cfg.std_schedule, step)
-		self.model.train()
+            srank = self.model.compute_srank(self.aug(obs))
+    
+            # Copy pour rollout
+            z = z_backbone
+            
+            
+            fzar = self.model.compute_fzar_from_obs(self.aug(obs))
 
-		# Representation
-		z = self.model.h(self.aug(obs))
-		zs = [z.detach()]
+            zs[0] = z
+            
+            consistency_loss = 0
+            reward_loss = 0
+            value_loss = 0
 
-		consistency_loss, reward_loss, value_loss, priority_loss = 0, 0, 0, 0
-		for t in range(self.cfg.horizon):
+            for t in range(self.cfg.horizon):
+                # Prédictions
+                qs = self.model.Q(z, action[t]) # Ensemble de 5 Q
+                z, reward_pred = self.model.next(z, action[t])
+                zs[t+1] = z
+                
+                # Calcul des pertes avec pondération rho (temporelle)
+                rho = (self.cfg.rho ** t)
+                
+                # Consistance : l'état imaginé doit ressembler à l'état réel encodé
+                with torch.no_grad():
+                    z_real = self.model_target.h(self.aug(next_obses[t]))
+                
+                consistency_loss += rho * h.mse(z, z_real, reduce=True)
+                reward_loss += rho * h.mse(reward_pred, reward[t], reduce=True)
+                
+                # Valeur : chaque Q de l'ensemble doit prédire la cible TD
+                for q_pred in qs:
+                    value_loss += rho * h.mse(q_pred, td_targets[t], reduce=True)
 
-			# Predictions
-			Q1, Q2 = self.model.Q(z, action[t])
-			z, reward_pred = self.model.next(z, action[t])
-			with torch.no_grad():
-				next_obs = self.aug(next_obses[t])
-				next_z = self.model_target.h(next_obs)
-				td_target = self._td_target(next_obs, reward[t])
-			zs.append(z.detach())
+            # 3. Normalisation (La clé de TD-MPC2)
+            consistency_loss /= self.cfg.horizon
+            reward_loss /= self.cfg.horizon
+            value_loss /= (self.cfg.horizon * 5) # Divisé par l'horizon ET num_q
 
-			# Losses
-			rho = (self.cfg.rho ** t)
-			consistency_loss += rho * torch.mean(h.mse(z, next_z), dim=1, keepdim=True)
-			reward_loss += rho * h.mse(reward_pred, reward[t])
-			value_loss += rho * (h.mse(Q1, td_target) + h.mse(Q2, td_target))
-			priority_loss += rho * (h.l1(Q1, td_target) + h.l1(Q2, td_target))
+            total_loss = (
+                self.cfg.consistency_coef * consistency_loss +
+                self.cfg.reward_coef * reward_loss +
+                self.cfg.value_coef * value_loss
+            )
 
-		# Optimize model
-		total_loss = self.cfg.consistency_coef * consistency_loss.clamp(max=1e4) + \
-					 self.cfg.reward_coef * reward_loss.clamp(max=1e4) + \
-					 self.cfg.value_coef * value_loss.clamp(max=1e4)
-		weighted_loss = (total_loss.squeeze(1) * weights).mean()
-		weighted_loss.register_hook(lambda grad: grad * (1/self.cfg.horizon))
-		weighted_loss.backward()
-		grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm, error_if_nonfinite=False)
-		self.optim.step()
-		replay_buffer.update_priorities(idxs, priority_loss.clamp(max=1e4).detach())
+            # 4. Optimisation du Modèle
+            total_loss.backward()
+            zgr = self.model.compute_zgr_from_z(z_backbone)
 
-		# Update policy + target network
-		pi_loss = self.update_pi(zs)
-		if step % self.cfg.update_freq == 0:
-			h.ema(self.model, self.model_target, self.cfg.tau)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
+            self.optim.step()
 
-		self.model.eval()
-		return {'consistency_loss': float(consistency_loss.mean().item()),
-				'reward_loss': float(reward_loss.mean().item()),
-				'value_loss': float(value_loss.mean().item()),
-				'pi_loss': pi_loss,
-				'total_loss': float(total_loss.mean().item()),
-				'weighted_loss': float(weighted_loss.mean().item()),
-				'grad_norm': float(grad_norm)}
+            # 5. Mise à jour de la Politique (avec toute la séquence zs)
+            pi_loss = self.update_pi(zs.detach())
+
+            # 6. Mise à jour lente du réseau Target (EMA)
+            if step % self.cfg.update_freq == 0:
+                h.ema(self.model, self.model_target, self.cfg.tau)
+
+            self.model.eval()
+            return {
+                'total_loss': total_loss.item(),
+                'pi_loss': pi_loss,
+                'grad_norm': grad_norm.item(),
+                'weight_distance': self.calculate_weight_distance(), 
+    			'weight_magnitude': self.calculate_weight_magnitude(),
+       			'zgr' : zgr,
+          		'fzar':fzar,
+            	'srank':srank
+            }
+            
+            
+    @torch.no_grad()
+    def calculate_weight_magnitude(self):
+        total_magnitude = 0
+        for param in self.model.parameters():
+            if param.requires_grad:
+                layer_mean_sq = param.pow(2).mean()
+                total_magnitude += layer_mean_sq
+                
+        return total_magnitude.item()
+
+    @torch.no_grad()
+    def calculate_weight_distance(self):
+        """
+        Calcule la Distance des Poids : 
+        Somme des moyennes des distances quadratiques (w - w0)^2 par couche.
+        """
+        total_distance = 0
+        for p, p0 in zip(self.model.parameters(), self.initial_model.parameters()):
+            if p.requires_grad:
+                layer_dist = (p - p0).pow(2).mean()
+                total_distance += layer_dist
+                
+        return total_distance.item()

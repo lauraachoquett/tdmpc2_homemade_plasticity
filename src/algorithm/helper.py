@@ -6,9 +6,89 @@ import torch.nn.functional as F
 from torch import distributions as pyd
 from torch.distributions.utils import _standard_normal
 
-
+if torch.backends.mps.is_available():
+    DEVICE = torch.device('mps')
+elif torch.cuda.is_available():
+    DEVICE = torch.device('cuda')
+else:
+    DEVICE = torch.device('cpu')
+    
 __REDUCE__ = lambda b: 'mean' if b else 'none'
 
+
+# --- Nouveaux composants TD-MPC2 ---
+
+def gaussian_logprob(eps, log_std):
+	"""Compute Gaussian log probability."""
+	residual = -0.5 * eps.pow(2) - log_std
+	log_prob = residual - 0.9189385175704956
+	return log_prob.sum(-1, keepdim=True)
+
+class SimNorm(nn.Module):
+    """Normalisation simpliciale pour stabiliser l'espace latent."""
+    def __init__(self, cfg):
+        super().__init__()
+        self.dim = cfg.simnorm_dim if hasattr(cfg, 'simnorm_dim') else 8
+
+    def forward(self, x):
+        shp = x.shape
+        x = x.view(*shp[:-1], -1, self.dim)
+        x = F.softmax(x, dim=-1)
+        return x.view(*shp)
+
+class NormedLinear(nn.Linear):
+    """Couche linéaire avec LayerNorm et Mish activation."""
+    def __init__(self, *args, dropout=0., act=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ln = nn.LayerNorm(self.out_features)
+        self.act = act if act is not None else nn.Mish()
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else None
+
+    def forward(self, x):
+        x = super().forward(x)
+        if self.dropout:
+            x = self.dropout(x)
+        return self.act(self.ln(x))
+
+def mlp(in_dim, mlp_dim, out_dim, dropout=0., last_act=None):
+    """Générateur de MLP robuste type TD-MPC2."""
+    if isinstance(mlp_dim, int):
+        mlp_dim = [mlp_dim, mlp_dim]
+    
+    layers = [
+        NormedLinear(in_dim, mlp_dim[0], dropout=dropout),
+        NormedLinear(mlp_dim[0], mlp_dim[1])
+    ]
+    
+    if last_act:
+        layers.append(NormedLinear(mlp_dim[1], out_dim, act=last_act))
+    else:
+        layers.append(nn.Linear(mlp_dim[1], out_dim))
+        
+    return nn.Sequential(*layers)
+
+# --- Fonctions utilitaires adaptées ---
+
+def enc(cfg):
+    """Encodeur TOLD mis à jour avec SimNorm et Mish."""
+    if cfg.modality == 'pixels':
+        C = int(3*cfg.frame_stack)
+        layers = [NormalizeImg(),
+                  nn.Conv2d(C, cfg.num_channels, 7, stride=2), nn.Mish(),
+                  nn.Conv2d(cfg.num_channels, cfg.num_channels, 5, stride=2), nn.Mish(),
+                  nn.Conv2d(cfg.num_channels, cfg.num_channels, 3, stride=2), nn.Mish(),
+                  nn.Conv2d(cfg.num_channels, cfg.num_channels, 3, stride=2), nn.Mish()]
+        out_shape = _get_out_shape((C, cfg.img_size, cfg.img_size), layers)
+        layers.extend([Flatten(), nn.Linear(np.prod(out_shape), cfg.latent_dim), SimNorm(cfg)])
+    else:
+        # Mode State : Utilise NormedLinear et SimNorm
+        layers = [NormedLinear(cfg.obs_shape[0], cfg.enc_dim),
+                  NormedLinear(cfg.enc_dim, cfg.latent_dim, act=SimNorm(cfg))]
+    return nn.Sequential(*layers)
+
+def q(cfg):
+    """Q-function avec 1% Dropout et LayerNorm."""
+    return mlp(cfg.latent_dim + cfg.action_dim, cfg.mlp_dim, 1, dropout=0.01)
 
 def l1(pred, target, reduce=False):
 	"""Computes the L1-loss between predictions and targets."""
@@ -95,37 +175,6 @@ class Flatten(nn.Module):
 		return x.view(x.size(0), -1)
 
 
-def enc(cfg):
-	"""Returns a TOLD encoder."""
-	if cfg.modality == 'pixels':
-		C = int(3*cfg.frame_stack)
-		layers = [NormalizeImg(),
-				  nn.Conv2d(C, cfg.num_channels, 7, stride=2), nn.ReLU(),
-				  nn.Conv2d(cfg.num_channels, cfg.num_channels, 5, stride=2), nn.ReLU(),
-				  nn.Conv2d(cfg.num_channels, cfg.num_channels, 3, stride=2), nn.ReLU(),
-				  nn.Conv2d(cfg.num_channels, cfg.num_channels, 3, stride=2), nn.ReLU()]
-		out_shape = _get_out_shape((C, cfg.img_size, cfg.img_size), layers)
-		layers.extend([Flatten(), nn.Linear(np.prod(out_shape), cfg.latent_dim)])
-	else:
-		layers = [nn.Linear(cfg.obs_shape[0], cfg.enc_dim), nn.ELU(),
-				  nn.Linear(cfg.enc_dim, cfg.latent_dim)]
-	return nn.Sequential(*layers)
-
-
-def mlp(in_dim, mlp_dim, out_dim, act_fn=nn.ELU()):
-	"""Returns an MLP."""
-	if isinstance(mlp_dim, int):
-		mlp_dim = [mlp_dim, mlp_dim]
-	return nn.Sequential(
-		nn.Linear(in_dim, mlp_dim[0]), act_fn,
-		nn.Linear(mlp_dim[0], mlp_dim[1]), act_fn,
-		nn.Linear(mlp_dim[1], out_dim))
-
-def q(cfg, act_fn=nn.ELU()):
-	"""Returns a Q-function that uses Layer Normalization."""
-	return nn.Sequential(nn.Linear(cfg.latent_dim+cfg.action_dim, cfg.mlp_dim), nn.LayerNorm(cfg.mlp_dim), nn.Tanh(),
-						 nn.Linear(cfg.mlp_dim, cfg.mlp_dim), nn.ELU(),
-						 nn.Linear(cfg.mlp_dim, 1))
 
 
 class RandomShiftsAug(nn.Module):
@@ -235,14 +284,14 @@ class ReplayBuffer():
 	def _get_obs(self, arr, idxs):
 		if self.cfg.modality == 'state':
 			return arr[idxs]
-		obs = torch.empty((self.cfg.batch_size, 3*self.cfg.frame_stack, *arr.shape[-2:]), dtype=arr.dtype, device=torch.device('cuda'))
-		obs[:, -3:] = arr[idxs].cuda()
+		obs = torch.empty((self.cfg.batch_size, 3*self.cfg.frame_stack, *arr.shape[-2:]), dtype=arr.dtype, device=DEVICE)
+		obs[:, -3:] = arr[idxs].to(DEVICE)
 		_idxs = idxs.clone()
 		mask = torch.ones_like(_idxs, dtype=torch.bool)
 		for i in range(1, self.cfg.frame_stack):
 			mask[_idxs % self.cfg.episode_length == 0] = False
 			_idxs[mask] -= 1
-			obs[:, -(i+1)*3:-i*3] = arr[_idxs].cuda()
+			obs[:, -(i+1)*3:-i*3] = arr[_idxs].to(DEVICE)
 		return obs.float()
 
 	def sample(self):
@@ -265,10 +314,9 @@ class ReplayBuffer():
 			reward[t] = self._reward[_idxs]
 
 		mask = (_idxs+1) % self.cfg.episode_length == 0
-		next_obs[-1, mask] = self._last_obs[_idxs[mask]//self.cfg.episode_length].cuda().float()
-		if not action.is_cuda:
-			action, reward, idxs, weights = \
-				action.cuda(), reward.cuda(), idxs.cuda(), weights.cuda()
+		next_obs[-1, mask] = self._last_obs[_idxs[mask]//self.cfg.episode_length].to(DEVICE).float()
+		if action.device.type != DEVICE.type:
+			action, reward, idxs, weights = action.to(DEVICE), reward.to(DEVICE), idxs.to(DEVICE), weights.to(DEVICE)
 
 		return obs, next_obs, action, reward.unsqueeze(2), idxs, weights
 

@@ -1,7 +1,7 @@
 import os
 import re
 from omegaconf import OmegaConf
-
+import torch
 
 def parse_cfg(cfg_path: str) -> OmegaConf:
 	"""Parses a config file and returns an OmegaConf object."""
@@ -40,9 +40,17 @@ def parse_cfg(cfg_path: str) -> OmegaConf:
 				if isinstance(base[k], float) and base[k].is_integer():
 					base[k] = int(base[k])
 
-	# Convenience
 	base.task_title = base.task.replace('-', ' ').title()
-	base.device = 'cuda' if base.modality == 'state' else 'cpu'
+
+	if torch.backends.mps.is_available():
+		accelerator = 'mps'   
+	elif torch.cuda.is_available():
+		accelerator = 'cuda'  
+	else:
+		accelerator = 'cpu'  
+
+	base.device = accelerator 
+	print("Device : ", base.device)
 	base.exp_name = str(base.get('exp_name', 'default'))
 
 	return base

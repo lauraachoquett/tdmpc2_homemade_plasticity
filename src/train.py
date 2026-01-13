@@ -2,7 +2,7 @@ import warnings
 warnings.filterwarnings('ignore')
 import os
 os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
-os.environ['MUJOCO_GL'] = 'egl'
+os.environ['MUJOCO_GL'] = 'glfw'
 import torch
 import numpy as np
 import gym
@@ -20,10 +20,15 @@ __CONFIG__, __LOGS__ = 'cfgs', 'logs'
 
 
 def set_seed(seed):
-	random.seed(seed)
-	np.random.seed(seed)
-	torch.manual_seed(seed)
-	torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed) 
+    
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
 
 
 def evaluate(env, agent, num_episodes, step, env_step, video):
@@ -45,7 +50,8 @@ def evaluate(env, agent, num_episodes, step, env_step, video):
 
 def train(cfg):
 	"""Training script for TD-MPC. Requires a CUDA-enabled device."""
-	assert torch.cuda.is_available()
+ 
+        
 	set_seed(cfg.seed)
 	work_dir = Path().cwd() / __LOGS__ / cfg.task / cfg.modality / cfg.exp_name / str(cfg.seed)
 	env, agent, buffer = make_env(cfg), TDMPC(cfg), ReplayBuffer(cfg)

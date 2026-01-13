@@ -10,7 +10,9 @@ from omegaconf import OmegaConf
 
 
 CONSOLE_FORMAT = [('episode', 'E', 'int'), ('env_step', 'S', 'int'), ('episode_reward', 'R', 'float'), ('total_time', 'T', 'time')]
-AGENT_METRICS = ['consistency_loss', 'reward_loss', 'value_loss', 'total_loss', 'weighted_loss', 'pi_loss', 'grad_norm']
+AGENT_METRICS = ['grad_norm', 
+    'weight_distance', 'weight_magnitude','zgr','fzar','srank'
+]
 
 
 def make_dir(dir_path):
@@ -138,10 +140,23 @@ class Logger(object):
 			raise f'invalid log format type: {ty}'
 
 	def _print(self, d, category):
-		category = colored(category, 'blue' if category == 'train' else 'green')
-		pieces = [f' {category:<14}']
+		category_col = colored(category, 'blue' if category == 'train' else 'green')
+		pieces = [f' {category_col:<14}']
+		
+		# 1. Affiche le format de base (Episode, Step, Reward)
 		for k, disp_k, ty in CONSOLE_FORMAT:
-			pieces.append(f'{self._format(disp_k, d.get(k, 0), ty):<26}')
+			pieces.append(f'{self._format(disp_k, d.get(k, 0), ty):<20}')
+		
+		# 2. Affiche dynamiquement les AGENT_METRICS si elles sont présentes
+		if category == 'train':
+			for k in AGENT_METRICS:
+				if k in d:
+					# On utilise un format court pour les pertes (ex: L: 0.01)
+					disp_k = k.split('_')[0][0].upper() # Prend la première lettre
+					if 'loss' in k: disp_k = 'L' + k[0].upper()
+					val = d[k]
+					pieces.append(f'{colored(disp_k+":", "grey")} {val:.03f}')
+
 		print('   '.join(pieces))
 
 	def log(self, d, category='train'):
@@ -153,4 +168,19 @@ class Logger(object):
 			keys = ['env_step', 'episode_reward']
 			self._eval.append(np.array([d[keys[0]], d[keys[1]]]))
 			pd.DataFrame(np.array(self._eval)).to_csv(self._log_dir / 'eval.log', header=keys, index=None)
+		if category == 'train':
+				# 1. On fixe la liste complète des colonnes attendues
+				fixed_keys = ['env_step', 'episode_reward'] + AGENT_METRICS
+				
+				# 2. On crée un dictionnaire avec toutes les clés initialisées à NaN ou 0
+				# On ne prend que ce qui nous intéresse dans d
+				row = {k: d.get(k, np.nan) for k in fixed_keys}
+				
+				log_file = self._log_dir / 'train.log'
+				
+				# 3. Mode append ('a') pour éviter de tout recalculer en RAM (plus efficace sur ton M2)
+				# On n'écrit le header que si le fichier n'existe pas encore
+				df = pd.DataFrame([row], columns=fixed_keys)
+				df.to_csv(log_file, mode='a', header=not log_file.exists(), index=False)
+			
 		self._print(d, category)
