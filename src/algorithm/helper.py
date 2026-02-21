@@ -25,7 +25,6 @@ def gaussian_logprob(eps, log_std):
 	return log_prob.sum(-1, keepdim=True)
 
 class SimNorm(nn.Module):
-    """Normalisation simpliciale pour stabiliser l'espace latent."""
     def __init__(self, cfg):
         super().__init__()
         self.dim = cfg.simnorm_dim if hasattr(cfg, 'simnorm_dim') else 8
@@ -37,7 +36,6 @@ class SimNorm(nn.Module):
         return x.view(*shp)
 
 class NormedLinear(nn.Linear):
-    """Couche linéaire avec LayerNorm et Mish activation."""
     def __init__(self, *args, dropout=0., act=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.ln = nn.LayerNorm(self.out_features)
@@ -51,7 +49,6 @@ class NormedLinear(nn.Linear):
         return self.act(self.ln(x))
 
 def mlp(in_dim, mlp_dim, out_dim, dropout=0., last_act=None):
-    """Générateur de MLP robuste type TD-MPC2."""
     if isinstance(mlp_dim, int):
         mlp_dim = [mlp_dim, mlp_dim]
     
@@ -70,7 +67,6 @@ def mlp(in_dim, mlp_dim, out_dim, dropout=0., last_act=None):
 # --- Fonctions utilitaires adaptées ---
 
 def enc(cfg):
-    """Encodeur TOLD mis à jour avec SimNorm et Mish."""
     if cfg.modality == 'pixels':
         C = int(3*cfg.frame_stack)
         layers = [NormalizeImg(),
@@ -87,7 +83,7 @@ def enc(cfg):
     return nn.Sequential(*layers)
 
 def q(cfg):
-    """Q-function avec 1% Dropout et LayerNorm."""
+    """Q-function with 1% Dropout and LayerNorm."""
     return mlp(cfg.latent_dim + cfg.action_dim, cfg.mlp_dim, 1, dropout=0.01)
 
 def l1(pred, target, reduce=False):

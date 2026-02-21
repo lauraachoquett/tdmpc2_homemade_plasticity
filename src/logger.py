@@ -11,9 +11,8 @@ from omegaconf import OmegaConf
 
 CONSOLE_FORMAT = [('episode', 'E', 'int'), ('env_step', 'S', 'int'), ('episode_reward', 'R', 'float'), ('total_time', 'T', 'time')]
 AGENT_METRICS = ['grad_norm', 
-    'weight_distance', 'weight_magnitude','zgr','fzar','srank'
+    'weight_distance', 'weight_magnitude','zgr','fzar','srank', 'grad_cov_rank','grad_cov_frob','eNTK_rank','eNTK_frob'
 ]
-
 
 def make_dir(dir_path):
 	"""Create directory if it does not already exist."""
@@ -151,9 +150,16 @@ class Logger(object):
 		if category == 'train':
 			for k in AGENT_METRICS:
 				if k in d:
-					# On utilise un format court pour les pertes (ex: L: 0.01)
-					disp_k = k.split('_')[0][0].upper() # Prend la première lettre
-					if 'loss' in k: disp_k = 'L' + k[0].upper()
+					# Construction de l'abréviation
+					if '_' in k:
+						disp_k = ''.join([word[0].upper() for word in k.split('_')])
+					else:
+						disp_k = k[0].upper()
+
+					# Si c'est une perte, prefixer avec 'L'
+					if 'loss' in k.lower():
+						disp_k = 'L' + disp_k
+
 					val = d[k]
 					pieces.append(f'{colored(disp_k+":", "grey")} {val:.03f}')
 

@@ -4,32 +4,36 @@ import torch.nn as nn
 import torch.nn.functional as F
 from copy import deepcopy
 import algorithm.helper as h
+import time
+from torch.func import functional_call, vmap, jacrev
 
 class TOLD(nn.Module):
     """
-    Modèle TOLD mis à jour avec l'architecture TD-MPC2 :
+    Told model with new architecture components:
     - LayerNorm + Mish (via h.mlp / h.q)
-    - SimNorm sur l'état latent
-    - Ensemble de 5 Q-functions
-    - Politique stochastique (MaxEnt RL)
+    - SimNorm on latent representation
+    - 5 Q-functions
+    - Stochastic policy (MaxEnt RL)
     """
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self._encoder = h.enc(cfg) # Inclut déjà SimNorm dans le nouveau helper
-        
-        # Dynamique avec SimNorm en sortie
+        self._encoder = h.enc(cfg) 
+        trainable_params = sum(p.numel() for p in self._encoder.parameters() if p.requires_grad)
+        print(f"Trainable parameters in ENCODER : {trainable_params}")
+
+        # Transition dynamic function with SimNorm
         self._dynamics = h.mlp(cfg.latent_dim+cfg.action_dim, cfg.mlp_dim, cfg.latent_dim, last_act=h.SimNorm(cfg))
         self._reward = h.mlp(cfg.latent_dim+cfg.action_dim, cfg.mlp_dim, 1)
         
-        # Politique stochastique : sort Moyenne + LogStd (2 * action_dim)
+        # Stochastic policy
         self._pi = h.mlp(cfg.latent_dim, cfg.mlp_dim, 2*cfg.action_dim)
         
-        # Ensemble de 5 Q-functions avec Dropout (défini dans h.q)
+        # 5 Q-functions with Dropout
         self._Qs = nn.ModuleList([h.q(cfg) for _ in range(5)])
         
         self.apply(h.orthogonal_init)
-        # Initialisation à zéro de la dernière couche pour stabiliser le début
+        # Initialize the last layer to zero
         for m in [self._reward]:
             m[-1].weight.data.fill_(0)
             m[-1].bias.data.fill_(0)
@@ -46,9 +50,9 @@ class TOLD(nn.Module):
         return self._dynamics(x), self._reward(x)
 
     def pi(self, z, eval_mode=False):
-        """Politique Gaussienne avec reparamétrisation (MaxEnt RL)"""
+        """Gaussian policy with reparametrization (MaxEnt RL)"""
         mu, log_std = self._pi(z).chunk(2, dim=-1)
-        log_std = torch.clamp(log_std, -10, 2) # Bornes de stabilité
+        log_std = torch.clamp(log_std, -10, 2) # For stability
         std = log_std.exp()
         
         if eval_mode:
@@ -57,12 +61,12 @@ class TOLD(nn.Module):
         eps = torch.randn_like(mu)
         action = torch.tanh(mu + eps * std)
         
-        # Calcul de l'entropie (approximée pour le squashing tanh)
+        # Compute entropy 
         log_prob = h.gaussian_logprob(eps, log_std) - torch.log(1 - action.pow(2) + 1e-6).sum(-1, keepdim=True)
         return action, log_prob
 
     def Q(self, z, a):
-        """Retourne les 5 prédictions de l'ensemble"""
+        """Return 5 predictions from the set"""
         x = torch.cat([z, a], dim=-1)
         return torch.stack([m(x) for m in self._Qs])
     
@@ -91,7 +95,7 @@ class TOLD(nn.Module):
 
     def compute_srank(self, obs: torch.Tensor, delta: float = 0.01) -> int:
         """
-        Compute the effective feature rank (srank) of the backbone output.
+        Compute the effective feature rank (srank) of the encoder output.
         obs: batch of observations
         delta: threshold for cumulative singular values (default 0.01)
         """
@@ -106,6 +110,73 @@ class TOLD(nn.Module):
             total_sum = sigma.sum()
             k = torch.searchsorted(cum_sum / total_sum, 1 - delta)
             return int(k.item() + 1)
+        
+    def compute_gradient_covariance(self, loss_per_sample, device):
+        """Compute gradient covariance matrix"""
+        encoder_params = [p for p in self._encoder.parameters() if p.requires_grad]
+        N = loss_per_sample.shape[0] // 6  # Sous-échantillonnage
+        P = sum(p.numel() for p in encoder_params)
+        
+        G = torch.zeros(N, P, device=device)
+        
+        step = loss_per_sample.shape[0] // N  # = 6
+        for i in range(N):
+            idx = i * step  # Échantillonner uniformément
+            grads = torch.autograd.grad(
+                outputs=loss_per_sample[idx],
+                inputs=encoder_params,
+                retain_graph=True,
+                create_graph=False  
+            )
+            grads_flat = torch.cat([g.view(-1) for g in grads])
+            G[i] = grads_flat / (grads_flat.norm() + 1e-10)
+        
+        # Matrice de Gram (similarité cosinus)
+        Gram = G @ G.T
+        
+        return Gram
+    
+    def get_k_center_indices(self, z, k=36):
+        n = z.shape[0]  
+
+        if n < k:
+            k = n
+
+        selected_indices = [torch.randint(0, n, (1,)).item()]
+        
+        min_distances = torch.cdist(z[selected_indices], z, p=2).min(dim=0).values
+
+        ## Greedy selection of z elements far from each other
+        for _ in range(1, k):
+            new_idx = torch.argmax(min_distances).item()
+            selected_indices.append(new_idx)
+            new_dist = torch.norm(z - z[new_idx], dim=1)
+            min_distances = torch.min(min_distances, new_dist)
+            
+        return selected_indices
+    
+    def compute_eNTK(self, obs):
+        start_time= time.time()
+        
+        z = self.h(obs)
+        indices = self.get_k_center_indices(z.detach(), k=36)
+        obs_reduced	 = obs[indices]
+        params = {k: v.detach() for k, v in self._encoder.named_parameters()}
+        def fnet_single(params, x):
+            return functional_call(self._encoder, params, (x.unsqueeze(0),)).squeeze(0)
+
+        jacs = vmap(jacrev(fnet_single), in_dims=(None, 0))(params, obs_reduced)
+
+        flat_jacs = torch.cat([j.flatten(2) for j in jacs.values()], dim=2)
+        
+        j_full = flat_jacs.view(36 * 50, -1) 
+        eNTK_full = j_full @ j_full.T
+        
+        # j_pseudo = flat_jacs.sum(dim=1) # (36, P)
+        # pNTK = j_pseudo @ j_pseudo.T
+        
+        print("Time to compute eNTK in s : ",(time.time()-start_time))
+        return eNTK_full 
 
 class TDMPC():
     def __init__(self, cfg):
@@ -213,7 +284,7 @@ class TDMPC():
         target_q_min = torch.min(target_qs[torch.randperm(5)[:2]], dim=0).values
         return reward + self.cfg.discount * target_q_min
 
-    def update(self, replay_buffer, step):
+    def update(self, replay_buffer, step,compute_metrics=False,compute_K=False):
             """
             Version adaptée de TD-MPC2 :
             1. Rollout latent complet d'abord.
@@ -222,9 +293,13 @@ class TDMPC():
             """
             # Échantillonnage (Uniforme par défaut dans TD-MPC2)
             obs, next_obses, action, reward, idxs, weights = replay_buffer.sample()
-            
             self.optim.zero_grad(set_to_none=True)
             self.model.train()
+            
+            #Metrics :
+            fzar = 0
+            srank = 0
+            zgr = 0
 
             # 1. Préparation des cibles TD (avec le réseau Target)
             with torch.no_grad():
@@ -243,14 +318,16 @@ class TDMPC():
             z_backbone = self.model.h(self.aug(obs))
             z_backbone.retain_grad()
 
-            srank = self.model.compute_srank(self.aug(obs))
+            if compute_metrics:
+                srank = self.model.compute_srank(self.aug(obs))
+                fzar = self.model.compute_fzar_from_obs(self.aug(obs))
+                
+            if compute_K:
+                eNTK = self.model.compute_eNTK(self.aug(obs))
     
             # Copy pour rollout
             z = z_backbone
             
-            
-            fzar = self.model.compute_fzar_from_obs(self.aug(obs))
-
             zs[0] = z
             
             consistency_loss = 0
@@ -269,28 +346,31 @@ class TDMPC():
                 # Consistance : l'état imaginé doit ressembler à l'état réel encodé
                 with torch.no_grad():
                     z_real = self.model_target.h(self.aug(next_obses[t]))
-                
-                consistency_loss += rho * h.mse(z, z_real, reduce=True)
-                reward_loss += rho * h.mse(reward_pred, reward[t], reduce=True)
+                consistency_loss += rho * torch.mean(h.mse(z, z_real), dim=1, keepdim=True)
+                reward_loss += rho * h.mse(reward_pred, reward[t])
                 
                 # Valeur : chaque Q de l'ensemble doit prédire la cible TD
                 for q_pred in qs:
-                    value_loss += rho * h.mse(q_pred, td_targets[t], reduce=True)
+                    value_loss += rho * h.mse(q_pred, td_targets[t])
 
             # 3. Normalisation (La clé de TD-MPC2)
             consistency_loss /= self.cfg.horizon
             reward_loss /= self.cfg.horizon
             value_loss /= (self.cfg.horizon * 5) # Divisé par l'horizon ET num_q
 
-            total_loss = (
-                self.cfg.consistency_coef * consistency_loss +
-                self.cfg.reward_coef * reward_loss +
+            total_loss = self.cfg.consistency_coef * consistency_loss + \
+                self.cfg.reward_coef * reward_loss + \
                 self.cfg.value_coef * value_loss
-            )
+                
+            if compute_K:
+                grad_cov = self.model.compute_gradient_covariance(total_loss.squeeze(1), self.device)
+            total_loss = total_loss.squeeze(1).mean()
 
-            # 4. Optimisation du Modèle
             total_loss.backward()
-            zgr = self.model.compute_zgr_from_z(z_backbone)
+            
+            # 4. Optimisation du Modèle
+            if compute_metrics :
+                zgr = self.model.compute_zgr_from_z(z_backbone)
 
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
             self.optim.step()
@@ -311,7 +391,10 @@ class TDMPC():
     			'weight_magnitude': self.calculate_weight_magnitude(),
        			'zgr' : zgr,
           		'fzar':fzar,
-            	'srank':srank
+            	'srank':srank,
+                'K':grad_cov if compute_K else 0,
+                'eNTK' : eNTK if compute_K else 0
+
             }
             
             

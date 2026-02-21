@@ -5,7 +5,7 @@ action_repeat: ???
 device: mps
 discount: 0.99
 episode_length: 1000/${action_repeat}
-train_steps: 500000/${action_repeat}
+train_steps: 250000/${action_repeat}
 
 # planning (TD-MPC2 Style)
 iterations: 6
@@ -34,12 +34,10 @@ num_q: 5           # Nouveau : Ensemble
 dropout: 0.01      # Nouveau : Stabilité Q
 std_schedule: linear(0.5, ${min_std}, 25000)
 horizon_schedule: linear(1, ${horizon}, 25000)
-grad_clip_norm: 20
+grad_clip_norm: 10
 seed_steps: 500
 update_freq: 2
 tau: 0.01
-enc_lr_scale: 0.1
-
 
 
 # architecture
@@ -47,6 +45,7 @@ enc_dim: 256
 mlp_dim: 512
 latent_dim: 50
 simnorm_dim: 10
+
 
 # wandb (insert your own)
 use_wandb: false
@@ -59,4 +58,4 @@ exp_name: default_mps
 eval_freq: 20000
 eval_episodes: 10
 save_video: false
-save_model: false
+save_model: true
