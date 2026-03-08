@@ -80,6 +80,13 @@ These metrics help characterize:
 
 Example training diagnostics:
 
+<p align="center">
+    <img src="media/comparison_all.png" width="700"/>
+    <br>
+    <i>Schematic pipeline of the algorithm</i>
+</p>
+
+
 --- 
 # Related Repository
 
