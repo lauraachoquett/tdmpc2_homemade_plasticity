@@ -14,6 +14,12 @@ Temporal Difference Model Predictive Control (**TD-MPC**) is a model-based reinf
 
 while performing **short-horizon planning in latent space**.
 
+<p align="center">
+    <img src="media/ae591483.png" width="700"/>
+    <br>
+    <i>Schematic representation of the path-planning and path-following pipeline.. </i>
+</p>
+
 TD-MPC2 introduces several architectural improvements designed to improve **scalability and robustness across tasks**.
 
 A key hypothesis explored in this project is that these improvements may partly stem from **better preservation of neural plasticity**.
