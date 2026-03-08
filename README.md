@@ -17,7 +17,7 @@ while performing **short-horizon planning in latent space**.
 <p align="center">
     <img src="media/ae591483.png" width="700"/>
     <br>
-    <i>Schematic representation of the path-planning and path-following pipeline.. </i>
+    <i>Schematic pipeline of the algorithm</i>
 </p>
 
 TD-MPC2 introduces several architectural improvements designed to improve **scalability and robustness across tasks**.
